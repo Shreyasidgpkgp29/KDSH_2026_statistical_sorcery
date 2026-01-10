@@ -1,85 +1,87 @@
-import pandas as pd
 import os
+import pandas as pd
+import sys
 
-# ==========================================
-# PART 1: THE "MOCK" MODULES (Temporary)
-# ==========================================
-# Right now, these functions live here. 
-# Later, you will DELETE this section and import them from your friends' files.
+# SAFETY: Ensure Python looks in the current folder for singest and prompts
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-def get_context_from_ingest(book_name, claim):
-    """
-    TEMPORARY PLACEHOLDER for Member 1 (Ingest).
-    Acts as if it searched the book and found text.
-    """
-    # M1's logic will go here later. For now, just return a dummy string.
-    return f"[MOCK CONTEXT]: Found info in {book_name} related to: {claim[:30]}..."
+# Use the community version you have installed
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import singest
+from prompts import verify_claim
 
-def verify_with_logic(context, claim):
-    """
-    TEMPORARY PLACEHOLDER for Member 3 (Logic).
-    Acts as if it checked the claim against the context.
-    """
-    # M3's logic will go here later. For now, return a random guess.
-    return "Consistent", "The evidence in the text supports the claim perfectly."
+# Path setup (using ../ because you are running from inside src/)
+# These point to the data folder in the root directory
+INPUT_FILE = "../data/train.csv"
+BOOKS_DIR = "../data"
+OUTPUT_FILE = "submission.csv"
 
-# ==========================================
-# PART 2: THE PIPELINE (Your Job)
-# ==========================================
+# SQLite fix for environments where the default sqlite3 is outdated
+try:
+    __import__('pysqlite3')
+    import sys
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    pass
 
-def run_pipeline(input_csv, output_csv):
-    print(f"🚀 Starting Pipeline using input: {input_csv}")
+def main():
+    print("🚀 Starting KDSH Handshake Pipeline...")
     
-    # 1. Load Data
-    try:
-        df = pd.read_csv(input_csv)
-        print(f"   Loaded {len(df)} rows.")
-    except Exception as e:
-        print(f"❌ Error loading CSV: {e}")
+    # Initialize using the older class you prefer
+    embeddings = OllamaEmbeddings(model="mxbai-embed-large", base_url="http://localhost:11434")
+    
+    # Load Data
+    if not os.path.exists(INPUT_FILE):
+        print(f"❌ Error: {INPUT_FILE} not found. Check your directory structure.")
         return
 
-    # 2. Prepare Storage for Results
-    results = []
+    df = pd.read_csv(INPUT_FILE).head(10) # Testing with first 10
+    df["book_name_std"] = df["book_name"].str.lower().str.strip()
+    
+    actual_files = [f for f in os.listdir(BOOKS_DIR) if f.endswith(".txt")]
+    output_data = []
 
-    # 3. Main Loop
-    for index, row in df.iterrows():
-        # Safety check: Clean up the book name text
-        b_name = str(row['book_name']).strip().lower()
-        claim_text = str(row['content']) # Assuming 'content' is the claim column
-        row_id = row['id']
+    # Process by Unique Book to save time/memory
+    for book_name in df["book_name_std"].unique():
+        target_filename = next((f for f in actual_files if f.lower() == f"{book_name}.txt"), None)
+        
+        if not target_filename:
+            print(f"⚠️ Skipping: {book_name} (No matching .txt file)")
+            continue
+            
+        book_path = os.path.join(BOOKS_DIR, target_filename)
+        print(f"📘 Processing: {target_filename}")
+        
+        # HANDSHAKE 1: Build Hybrid Vector DB from singest.py
+        # This will now process the full book safely using character-wise safety checks
+        vector_db = singest.get_vector_db(book_path, embeddings)
+        
+        book_claims = df[df["book_name_std"] == book_name]
+        print(f"  🔍 Checking {len(book_claims)} claims for this book...")
 
-        print(f"   Processing ID {row_id}...")
+        for _, row in book_claims.iterrows():
+            # HANDSHAKE 2: Retrieve the 5 most related chunks
+            results = vector_db.similarity_search(row["content"], k=5)
+            context_text = "\n---\n".join([doc.page_content for doc in results])
+            
+            # HANDSHAKE 3: Verify using logic in prompts.py
+            # verify_claim returns (label, rationale)
+            label, rationale = verify_claim(context_text, row["content"])
+            
+            output_data.append({
+                "id": row["id"],
+                "label": label,
+                "rationale": rationale
+            })
+        
+        # Cleanup: Crucial for 16GB RAM to prevent "Monte Cristo" from crashing the system
+        vector_db.delete_collection()
+        print(f"✅ Finished {target_filename}")
 
-        # --- STEP A: CALL MEMBER 1 (INGEST) ---
-        # "Hey M1, give me the context for this book and this claim."
-        context_result = get_context_from_ingest(b_name, claim_text)
+    # Save Final Results
+    pd.DataFrame(output_data).to_csv(OUTPUT_FILE, index=False)
+    print(f"\n🎉 Success! Results saved to {os.path.abspath(OUTPUT_FILE)}")
 
-        # --- STEP B: CALL MEMBER 3 (LOGIC) ---
-        # "Hey M3, here is the context M1 gave me. Is the claim true?"
-        label, rationale = verify_with_logic(context_result, claim_text)
-
-        # 4. Store the Answer
-        results.append({
-            "id": row_id,
-            "label": label,
-            "rationale": rationale
-        })
-
-    # 5. Save Final Output
-    output_df = pd.DataFrame(results)
-    output_df.to_csv(output_csv, index=False)
-    print(f"✅ Success! Results saved to {output_csv}")
-
-# ==========================================
-# PART 3: EXECUTION
-# ==========================================
 if __name__ == "__main__":
-    # Define your file paths here
-    INPUT_FILE = "data/mini_train.csv"  # Make sure this path matches your folder
-    OUTPUT_FILE = "submission.csv"
-
-    # Check if input exists to prevent crashing
-    if os.path.exists(INPUT_FILE):
-        run_pipeline(INPUT_FILE, OUTPUT_FILE)
-    else:
-        print(f"❌ Could not find {INPUT_FILE}. Please check your 'data' folder.")
+    main()
